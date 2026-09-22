@@ -1,0 +1,67 @@
+TITLE:: FMX6
+summary:: Six-operator phase-modulation matrix with selectable operator waveforms
+categories:: UGens>Generators>Deterministic
+related:: Classes/FM7
+
+DESCRIPTION::
+FMX6 is a six-operator matrix phase-modulation oscillator inspired by FM7. Each of the six operator outputs can phase-modulate any operator, including itself. Matrix feedback is calculated from the previous sample's six operator outputs, so feedback/cycles incur one sample of delay rather than one server block.
+
+Unlike FM7, operators can use several waveforms. Periodic non-sine waveforms are evaluated as truncated Fourier series at the phase-modulated phase. The harmonic count is limited according to an estimate of instantaneous frequency and by a user-provided per-operator harmonic limit.
+
+This reduces aliasing compared with a naive phase-modulated saw/pulse implementation, but it cannot guarantee alias-free output under arbitrary deep/high-rate phase modulation: PM itself can create sidebands beyond Nyquist.
+
+CLASSMETHODS::
+
+METHOD:: ar
+ARGUMENT:: ctlMatrix
+6 x 3 matrix. Each row is code::[frequencyHz, phaseOffsetRadians, amplitude]::.
+
+ARGUMENT:: modMatrix
+6 x 6 matrix. Rows are destinations; columns are sources. Values are phase-modulation depth in radians per unit source amplitude.
+
+ARGUMENT:: waves
+One value or six values. Waveforms are:
+list::
+## 0 sine
+## 1 triangle
+## 2 saw
+## 3 square
+## 4 pulse
+## 5 sample-and-hold noise
+## 6 white noise
+::
+
+ARGUMENT:: shapes
+One value or six values. For pulse this is duty cycle, clipped to 0.01..0.99. Reserved for future waveform-specific shape parameters for other waves.
+
+ARGUMENT:: harmonicLimits
+One value or six values, clipped to 1..128. Caps the Fourier-series harmonic count for triangle/saw/square/pulse.
+
+RETURNS::
+Six audio-rate channels, one per operator.
+
+METHOD:: controlMatrix
+Convenience constructor. Each argument is code::[operatorIndex, frequency, phase, amplitude]::.
+
+METHOD:: modMatrix
+Convenience constructor. Each argument is code::[destinationOperator, sourceOperator, depthRadians]::.
+
+EXAMPLES::
+code::
+(
+{
+    var ctl = [
+        [110, 0, 0.15],
+        [220, 0, 1.0],
+        [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]
+    ];
+    var mod = FMX6.modMatrix([0, 1, 3.5]);
+    var ops = FMX6.ar(
+        ctl, mod,
+        waves: [FMX6.triangle, FMX6.saw, 0, 0, 0, 0],
+        harmonicLimits: 32
+    );
+    ops[0] ! 2;
+}.play;
+)
+::
