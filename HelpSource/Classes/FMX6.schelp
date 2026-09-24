@@ -8,7 +8,7 @@ FMX6 is a six-operator matrix phase-modulation oscillator inspired by FM7. Each 
 
 Unlike FM7, operators can use several waveforms. Periodic non-sine waveforms are evaluated as truncated Fourier series at the phase-modulated phase. The harmonic count is limited according to an estimate of instantaneous frequency and by a user-provided per-operator harmonic limit.
 
-This reduces aliasing compared with a naive phase-modulated saw/pulse implementation, but it cannot guarantee alias-free output under arbitrary deep/high-rate phase modulation: PM itself can create sidebands beyond Nyquist.
+This reduces aliasing compared with a naive phase-modulated saw/pulse implementation, but on its own it cannot guarantee alias-free output under arbitrary deep/high-rate phase modulation: PM itself can create sidebands beyond Nyquist. The code::oversample:: argument runs the whole matrix at two or four times the sample rate and decimates every operator output with linear-phase halfband filters, which removes most of that aliasing.
 
 CLASSMETHODS::
 
@@ -29,13 +29,19 @@ list::
 ## 4 pulse
 ## 5 sample-and-hold noise
 ## 6 white noise
+## 7 filtered noise: white noise through a 2-pole state-variable filter (Q = 0.707) whose cutoff is the operator frequency
 ::
 
+Phase modulation has no effect on the noise waveforms; they can still modulate other operators.
+
 ARGUMENT:: shapes
-One value or six values. For pulse this is duty cycle, clipped to 0.01..0.99. Reserved for future waveform-specific shape parameters for other waves.
+One value or six values. For pulse this is duty cycle, clipped to 0.01..0.99. For filtered noise it selects the response, clipped to 0..1: 0 low-pass, 0.5 band-pass (unity gain at the centre frequency), 1 high-pass, crossfaded in between. Ignored by the other waves.
 
 ARGUMENT:: harmonicLimits
 One value or six values, clipped to 1..128. Caps the Fourier-series harmonic count for triangle/saw/square/pulse.
+
+ARGUMENT:: oversample
+1 (default), 2 or 4; fixed when the synth starts. Everything runs at that multiple of the sample rate, including the one-sample matrix feedback, and each operator output is decimated by halfband filters: 67 taps for the last factor of two (passband to 0.4 of the sample rate, 102 dB stopband) and 23 taps before it for 4x. Components that would alias are removed down to about 100 dB, except in the top 20% of the band (above 19.2 kHz at 48 kHz). Costs about as many times the CPU, and adds a latency of 16.5 samples (2x) or 19.25 samples (4x). With 1 the output is identical to earlier versions.
 
 RETURNS::
 Six audio-rate channels, one per operator.
@@ -62,6 +68,27 @@ code::
         harmonicLimits: 32
     );
     ops[0] ! 2;
+}.play;
+)
+
+// Inharmonic FM with a high-passed noise wash, oversampled 4x
+(
+{
+    var env = EnvGen.kr(Env.perc(0.002, 1.6), doneAction: Done.freeSelf);
+    var ctl = [
+        [211, 0, env],
+        [730, 0, env],
+        [11000, 0, env * 0.4],
+        [0, 0, 0], [0, 0, 0], [0, 0, 0]
+    ];
+    var mod = FMX6.modMatrix([0, 1, 2.5], [1, 1, 0.6]);
+    var ops = FMX6.ar(
+        ctl, mod,
+        waves: [FMX6.sine, FMX6.sine, FMX6.filteredNoise, 0, 0, 0],
+        shapes: [0.5, 0.5, 1.0, 0.5, 0.5, 0.5],
+        oversample: 4
+    );
+    (ops[0] + ops[2]) * 0.2 ! 2;
 }.play;
 )
 ::

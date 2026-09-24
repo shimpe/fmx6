@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 static InterfaceTable* ft;
 
@@ -18,15 +19,18 @@ constexpr double kInvTwoPi = 1.0 / kTwoPi;
 // Input layout:
 //   0 .. 17  : six [freq, phase, amp] triplets
 //   18 .. 23 : waveform selectors
-//   24 .. 29 : waveform shape (currently pulse duty; reserved for future waves)
+//   24 .. 29 : waveform shape (pulse: duty cycle; filtered noise: low-pass 0, band-pass 0.5, high-pass 1)
 //   30 .. 35 : per-operator harmonic limits
 //   36 .. 71 : 6x6 phase-modulation matrix, row-major (destination, source)
+//   72       : oversampling factor 1, 2 or 4 (optional; read once at construction; 1 when absent)
 constexpr int kCtlBase = 0;
 constexpr int kWaveBase = kNumOps * kNumControls;
 constexpr int kShapeBase = kWaveBase + kNumOps;
 constexpr int kHarmBase = kShapeBase + kNumOps;
 constexpr int kModBase = kHarmBase + kNumOps;
 constexpr int kNumInputs = kModBase + kNumMatrix;
+constexpr int kOversampleIndex = kNumInputs;
+constexpr int kMaxWave = 7;
 
 inline int ctlIndex(int op, int field) { return kCtlBase + op * kNumControls + field; }
 inline int freqIndex(int op) { return ctlIndex(op, 0); }
@@ -37,6 +41,66 @@ inline int shapeIndex(int op) { return kShapeBase + op; }
 inline int harmIndex(int op) { return kHarmBase + op; }
 inline int modIndex(int dest, int src) { return kModBase + dest * kNumOps + src; }
 
+// Halfband decimators: Kaiser-windowed, linear phase. The centre tap is 0.5, every even offset from it is zero, and
+// these are the taps at odd offsets 1, 3, 5, ... from the centre. Frequencies below are in cycles per sample at the
+// input of the stage.
+//
+// Final stage (2x -> 1x): 67 taps, beta 10.35. Passband to 0.2 (0.4 of the output rate: 19.2 kHz at 48 kHz),
+// ripple 0.00007 dB; stopband from 0.3, 102 dB. Only components above 0.4 of the output rate can alias, and they
+// land above 0.4 of it again.
+constexpr double kFinalTaps[] = {
+    0.31687588570509284, -0.10186909104321777, 0.056829847613847524, -0.03635784539753035,
+    0.024368801002835734, -0.016501836538929292, 0.011072803407119419, -0.007268077708132389,
+    0.0046189186309444205, -0.0028142241434505255, 0.0016261803924266208, -0.0008791917322733311,
+    0.00043639646857262306, -0.0001930582052257388, 7.213584500219032E-05, -2.0101383481845616E-05,
+    2.457086399902565E-06,
+};
+
+// First stage of 4x (4x -> 2x): 23 taps, beta 10.5. Passband to 0.1, ripple 0.0001 dB; stopband from 0.4, 98 dB.
+// Its transition band only has to stay clear of what the final stage passes.
+constexpr double kFirstTaps[] = {
+    0.3054193276781219, -0.0726917533603646, 0.02144931133186937, -0.004713801131178444,
+    0.0005433070647214894, -6.3915831696255476E-06,
+};
+
+constexpr int kFinalLength = 4 * static_cast<int>(sizeof(kFinalTaps) / sizeof(double)) - 1;
+constexpr int kFirstLength = 4 * static_cast<int>(sizeof(kFirstTaps) / sizeof(double)) - 1;
+
+// Decimates by two. Keeps the last (length - 1) inputs between calls in the front of its buffer.
+struct Halfband {
+    const double* taps;
+    int numTaps;  // taps at odd offsets
+    int length;   // full filter length
+    float* buffer; // (length - 1) history + room for one block of input
+
+    void init(const double* t, int n, int len, float* memory) {
+        taps = t;
+        numTaps = n;
+        length = len;
+        buffer = memory;
+        std::fill(buffer, buffer + (length - 1), 0.f);
+    }
+
+    // in may alias out: the input is copied into the buffer before anything is written.
+    void process(const float* in, int numIn, float* out) {
+        const int history = length - 1;
+        std::memcpy(buffer + history, in, sizeof(float) * static_cast<size_t>(numIn));
+        const int centre = history / 2;
+        for (int m = 0; m < numIn / 2; ++m) {
+            // Newest input of this output: buffer[history + 2m + 1]; the centre of the filter lies half the
+            // history before it, and history = 2 * centre.
+            const float* x = buffer + 2 * m + 1 + centre;
+            double y = 0.5 * static_cast<double>(x[0]);
+            for (int j = 0; j < numTaps; ++j) {
+                const int k = 2 * j + 1;
+                y += taps[j] * (static_cast<double>(x[-k]) + static_cast<double>(x[k]));
+            }
+            out[m] = static_cast<float>(y);
+        }
+        std::memmove(buffer, buffer + numIn, sizeof(float) * static_cast<size_t>(history));
+    }
+};
+
 struct FMX6Op {
     double phaseCycles;
     float freq;
@@ -46,11 +110,18 @@ struct FMX6Op {
     float mem;
     float sampleHold;
     std::uint32_t rng;
+    double svfIc1;
+    double svfIc2;
 };
 
 struct FMX6 : public Unit {
     FMX6Op ops[kNumOps];
     float mod[kNumMatrix];
+    int oversample;
+    float* memory;
+    float* scratch[kNumOps];
+    Halfband finalStage[kNumOps];
+    Halfband firstStage[kNumOps];
 };
 
 inline std::uint32_t xorshift32(std::uint32_t& state) {
@@ -145,8 +216,36 @@ inline float waveformHarmonic(int wave, double phaseRad, int harmonics, float sh
     }
 }
 
-inline float evalWaveform(FMX6Op& op, int wave, double phaseRad, float effectiveHz,
-                          int harmonicLimit, float shape, float sampleRate) {
+// Filtered noise: white noise through a TPT state-variable filter with Q = 1/sqrt(2). The cutoff is the operator
+// frequency; shape 0 = low-pass, 0.5 = band-pass (unity gain at the centre), 1 = high-pass, crossfaded in between.
+inline float filteredNoise(FMX6Op& op, float cutoffHz, float shape, float sampleRate, float noiseGain) {
+    const double x = static_cast<double>(randBipolar(op.rng) * noiseGain);
+    const double fc = std::max(10.0, std::min(static_cast<double>(std::fabs(cutoffHz)), 0.49 * static_cast<double>(sampleRate)));
+    const double g = std::tan(kPi * fc / static_cast<double>(sampleRate));
+    const double k = 1.4142135623730951; // 1/Q
+    const double a1 = 1.0 / (1.0 + g * (g + k));
+    const double a2 = g * a1;
+    const double a3 = g * a2;
+
+    const double v3 = x - op.svfIc2;
+    const double v1 = a1 * op.svfIc1 + a2 * v3;
+    const double v2 = op.svfIc2 + a2 * op.svfIc1 + a3 * v3;
+    op.svfIc1 = 2.0 * v1 - op.svfIc1;
+    op.svfIc2 = 2.0 * v2 - op.svfIc2;
+
+    const double lp = v2;
+    const double bp = k * v1;
+    const double hp = x - k * v1 - v2;
+
+    const double m = std::max(0.0, std::min(static_cast<double>(shape), 1.0));
+    const double y = m < 0.5
+        ? (1.0 - 2.0 * m) * lp + (2.0 * m) * bp
+        : (2.0 - 2.0 * m) * bp + (2.0 * m - 1.0) * hp;
+    return static_cast<float>(y);
+}
+
+inline float evalWaveform(FMX6Op& op, int wave, double phaseRad, float baseHz, float effectiveHz,
+                          int harmonicLimit, float shape, float sampleRate, float noiseGain) {
     switch (wave) {
     case 0: // sine
     case 1: // triangle
@@ -161,7 +260,10 @@ inline float evalWaveform(FMX6Op& op, int wave, double phaseRad, float effective
         return op.sampleHold;
 
     case 6: // white noise; phase modulation intentionally has no effect
-        return randBipolar(op.rng);
+        return randBipolar(op.rng) * noiseGain;
+
+    case 7: // filtered noise; the cutoff follows the operator frequency, phase modulation has no effect
+        return filteredNoise(op, baseHz, shape, sampleRate, noiseGain);
 
     default:
         return static_cast<float>(std::sin(std::remainder(phaseRad, kTwoPi)));
@@ -169,8 +271,17 @@ inline float evalWaveform(FMX6Op& op, int wave, double phaseRad, float effective
 }
 
 void FMX6_next(FMX6* unit, int inNumSamples) {
-    const float sampleRate = SAMPLERATE;
-    const float sampleDur = SAMPLEDUR;
+    // With oversampling everything runs at the higher rate, feedback included, and every operator output is
+    // decimated afterwards. Without it the operators write straight to the outputs, exactly as before.
+    const int os = unit->oversample;
+    const int numInner = inNumSamples * os;
+    const float sampleRate = SAMPLERATE * static_cast<float>(os);
+    const float sampleDur = SAMPLEDUR / static_cast<float>(os);
+    const float slopeScale = 1.f / static_cast<float>(os);
+
+    // White noise spreads its power over the whole oversampled band and the decimator keeps 1/os of it: the source
+    // is louder by sqrt(os) so that the noise waveforms keep their level. Exactly 1 without oversampling.
+    const float noiseGain = std::sqrt(static_cast<float>(os));
 
     float freq[kNumOps];
     float freqInc[kNumOps];
@@ -192,27 +303,27 @@ void FMX6_next(FMX6* unit, int inNumSamples) {
         FMX6Op& op = unit->ops[i];
 
         freq[i] = op.freq;
-        freqInc[i] = CALCSLOPE(IN0(freqIndex(i)), freq[i]);
+        freqInc[i] = CALCSLOPE(IN0(freqIndex(i)), freq[i]) * slopeScale;
 
         phaseOffset[i] = op.phaseOffset;
-        phaseOffsetInc[i] = CALCSLOPE(IN0(phaseIndex(i)), phaseOffset[i]);
+        phaseOffsetInc[i] = CALCSLOPE(IN0(phaseIndex(i)), phaseOffset[i]) * slopeScale;
 
         amp[i] = op.amp;
-        ampInc[i] = CALCSLOPE(IN0(ampIndex(i)), amp[i]);
+        ampInc[i] = CALCSLOPE(IN0(ampIndex(i)), amp[i]) * slopeScale;
 
-        wave[i] = std::max(0, std::min(6, static_cast<int>(std::lround(IN0(waveIndex(i))))));
+        wave[i] = std::max(0, std::min(kMaxWave, static_cast<int>(std::lround(IN0(waveIndex(i))))));
         shape[i] = IN0(shapeIndex(i));
         harmonicLimit[i] = std::max(1, std::min(128, static_cast<int>(std::lround(IN0(harmIndex(i))))));
 
-        outs[i] = OUT(i);
+        outs[i] = os == 1 ? OUT(i) : unit->scratch[i];
     }
 
     for (int i = 0; i < kNumMatrix; ++i) {
         mod[i] = unit->mod[i];
-        modInc[i] = CALCSLOPE(IN0(kModBase + i), mod[i]);
+        modInc[i] = CALCSLOPE(IN0(kModBase + i), mod[i]) * slopeScale;
     }
 
-    for (int s = 0; s < inNumSamples; ++s) {
+    for (int s = 0; s < numInner; ++s) {
         float matrixPhaseMod[kNumOps] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
         float nextMem[kNumOps];
         double nextPhase[kNumOps];
@@ -244,7 +355,7 @@ void FMX6_next(FMX6* unit, int inNumSamples) {
             pNext -= std::floor(pNext);
 
             const float osc = evalWaveform(
-                op, wave[i], phaseRad, effectiveHz, harmonicLimit[i], shape[i], sampleRate);
+                op, wave[i], phaseRad, freq[i], effectiveHz, harmonicLimit[i], shape[i], sampleRate, noiseGain);
 
             const float y = amp[i] * osc;
             outs[i][s] = y;
@@ -273,6 +384,18 @@ void FMX6_next(FMX6* unit, int inNumSamples) {
         for (int i = 0; i < kNumMatrix; ++i) mod[i] += modInc[i];
     }
 
+    if (os > 1) {
+        for (int i = 0; i < kNumOps; ++i) {
+            float* x = unit->scratch[i];
+            int n = numInner;
+            if (os == 4) {
+                unit->firstStage[i].process(x, n, x);
+                n /= 2;
+            }
+            unit->finalStage[i].process(x, n, OUT(i));
+        }
+    }
+
     for (int i = 0; i < kNumOps; ++i) {
         unit->ops[i].freq = freq[i];
         unit->ops[i].phaseOffset = phaseOffset[i];
@@ -286,14 +409,51 @@ void FMX6_clear(FMX6* unit, int inNumSamples) {
 }
 
 void FMX6_Ctor(FMX6* unit) {
+    unit->memory = nullptr;
+    unit->oversample = 1;
     SETCALC(FMX6_next);
 
-    if (unit->mNumInputs != kNumInputs || unit->mNumOutputs != kNumOps) {
-        Print("FMX6: expected %d inputs and %d outputs, got %d inputs and %d outputs.\n",
-              kNumInputs, kNumOps, unit->mNumInputs, unit->mNumOutputs);
+    // Without the oversampling input the UGen behaves as before; SynthDefs built before it existed keep working.
+    if ((unit->mNumInputs != kNumInputs && unit->mNumInputs != kNumInputs + 1) || unit->mNumOutputs != kNumOps) {
+        Print("FMX6: expected %d or %d inputs and %d outputs, got %d inputs and %d outputs.\n",
+              kNumInputs, kNumInputs + 1, kNumOps, unit->mNumInputs, unit->mNumOutputs);
         SETCALC(FMX6_clear);
         ClearUnitOutputs(unit, 1);
         return;
+    }
+
+    if (unit->mNumInputs > kNumInputs) {
+        const float requested = IN0(kOversampleIndex);
+        unit->oversample = requested >= 3.f ? 4 : (requested >= 1.5f ? 2 : 1);
+    }
+
+    if (unit->oversample > 1) {
+        // One block for everything: per operator the oversampled samples, the final stage and, for 4x, the first.
+        const int os = unit->oversample;
+        const int block = BUFLENGTH;
+        const int perScratch = block * os;
+        const int perFinal = (kFinalLength - 1) + block * 2;
+        const int perFirst = os == 4 ? (kFirstLength - 1) + block * 4 : 0;
+        const size_t total = static_cast<size_t>(kNumOps) * static_cast<size_t>(perScratch + perFinal + perFirst);
+        unit->memory = static_cast<float*>(RTAlloc(unit->mWorld, total * sizeof(float)));
+        if (unit->memory == nullptr) {
+            Print("FMX6: not enough real-time memory for %dx oversampling.\n", os);
+            SETCALC(FMX6_clear);
+            ClearUnitOutputs(unit, 1);
+            return;
+        }
+
+        float* p = unit->memory;
+        for (int i = 0; i < kNumOps; ++i) {
+            unit->scratch[i] = p;
+            p += perScratch;
+            unit->finalStage[i].init(kFinalTaps, static_cast<int>(sizeof(kFinalTaps) / sizeof(double)), kFinalLength, p);
+            p += perFinal;
+            if (os == 4) {
+                unit->firstStage[i].init(kFirstTaps, static_cast<int>(sizeof(kFirstTaps) / sizeof(double)), kFirstLength, p);
+                p += perFirst;
+            }
+        }
     }
 
     for (int i = 0; i < kNumOps; ++i) {
@@ -306,6 +466,8 @@ void FMX6_Ctor(FMX6* unit) {
         op.mem = 0.f;
         op.rng = 0x9E3779B9u ^ (0x85EBCA6Bu * static_cast<std::uint32_t>(i + 1));
         op.sampleHold = randBipolar(op.rng);
+        op.svfIc1 = 0.0;
+        op.svfIc2 = 0.0;
     }
 
     for (int i = 0; i < kNumMatrix; ++i) unit->mod[i] = IN0(kModBase + i);
@@ -313,9 +475,13 @@ void FMX6_Ctor(FMX6* unit) {
     ClearUnitOutputs(unit, 1);
 }
 
+void FMX6_Dtor(FMX6* unit) {
+    if (unit->memory != nullptr) RTFree(unit->mWorld, unit->memory);
+}
+
 } // namespace
 
 PluginLoad(FMX6) {
     ft = inTable;
-    DefineSimpleUnit(FMX6);
+    DefineDtorUnit(FMX6);
 }

@@ -3,7 +3,7 @@ FMX6 : MultiOutUGen {
     *numControls { ^3 }
     *controlArraySize { ^this.numOperators * this.numControls }
     *modArraySize { ^this.numOperators.squared }
-    *numRequiredInputs { ^this.controlArraySize + (this.numOperators * 3) + this.modArraySize }
+    *numRequiredInputs { ^this.controlArraySize + (this.numOperators * 3) + this.modArraySize + 1 }
 
     // ctlMatrix rows: [frequencyHz, phaseOffsetRadians, amplitude]
     *controlMatrix { |...args|
@@ -26,7 +26,7 @@ FMX6 : MultiOutUGen {
     }
 
     *ar {
-        |ctlMatrix, modMatrix, waves = 0, shapes = 0.5, harmonicLimits = 32|
+        |ctlMatrix, modMatrix, waves = 0, shapes = 0.5, harmonicLimits = 32, oversample = 1|
 
         var ctls;
         var mods;
@@ -49,7 +49,11 @@ FMX6 : MultiOutUGen {
         sh = Array.fill(6, { |i| shapes.asArray.wrapAt(i) });
         hs = Array.fill(6, { |i| harmonicLimits.asArray.wrapAt(i) });
 
-        inputs = ctls ++ ws ++ sh ++ hs ++ mods;
+        if([1, 2, 4].includes(oversample).not) {
+            Error("FMX6: oversample must be 1, 2 or 4.").throw;
+        };
+
+        inputs = ctls ++ ws ++ sh ++ hs ++ mods ++ [oversample];
         ^this.multiNewList(['audio'] ++ inputs)
     }
 
@@ -58,8 +62,9 @@ FMX6 : MultiOutUGen {
         ^this.initOutputs(this.class.numOperators, rate)
     }
 
+    // Without the last input (oversample) the plugin behaves as before it existed.
     checkInputs {
-        ^if(inputs.size != this.class.numRequiredInputs) {
+        ^if(inputs.size != this.class.numRequiredInputs and: { inputs.size != (this.class.numRequiredInputs - 1) }) {
             this.class.numRequiredInputs.asString ++ " inputs required (" ++ inputs.size ++ ")"
         }
     }
@@ -71,4 +76,5 @@ FMX6 : MultiOutUGen {
     *pulse { ^4 }
     *sampleHoldNoise { ^5 }
     *whiteNoise { ^6 }
+    *filteredNoise { ^7 }
 }

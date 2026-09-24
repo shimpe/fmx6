@@ -15,10 +15,11 @@ Extra operator waveforms:
 - 4 pulse (band-limited-ish additive Fourier series; `shape` is duty cycle)
 - 5 sample-and-hold noise
 - 6 white noise
+- 7 filtered noise (white noise through a 2-pole state-variable filter, Q = 0.707; the operator frequency is the cutoff, `shape` selects low-pass 0, band-pass 0.5, high-pass 1, crossfaded in between)
 
 For the periodic non-sine waveforms, harmonic count is dynamically capped using an estimate of instantaneous frequency (base frequency plus the sample-to-sample derivative of phase modulation). This is substantially safer than evaluating a naive discontinuous saw/pulse directly at an arbitrarily phase-modulated phase.
 
-**It is not mathematically alias-free.** Deep/high-rate PM can itself create sidebands above Nyquist even when the underlying waveform's Fourier series is band-limited. A future version could add internal oversampling and proper downsampling.
+**On its own it is not mathematically alias-free.** Deep/high-rate PM can itself create sidebands above Nyquist even when the underlying waveform's Fourier series is band-limited. The `oversample` argument (2 or 4) runs the whole matrix, feedback included, at that multiple of the sample rate and decimates each operator output with linear-phase halfband FIR filters: 67 taps for the last factor of two (passband to 0.4 of the sample rate, ripple 0.0001 dB, stopband 102 dB) and 23 taps before it for 4x (98 dB). Aliasing products then stay around -110 dB or lower, except for those that fold into the top 20% of the band (above 19.2 kHz at 48 kHz). It costs about 2x or 4x the CPU and adds 16.5 or 19.25 samples of latency. The noise waveforms are scaled so that their level does not depend on the factor. With `oversample: 1`, the default, the output is identical to earlier versions, and SynthDefs built without the argument keep working.
 
 ## API
 
@@ -28,7 +29,8 @@ FMX6.ar(
     modMatrix,
     waves: 0,
     shapes: 0.5,
-    harmonicLimits: 32
+    harmonicLimits: 32,
+    oversample: 1
 )
 ```
 
