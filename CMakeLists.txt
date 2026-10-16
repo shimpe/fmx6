@@ -24,8 +24,12 @@ if(APPLE OR WIN32)
     set_target_properties(FMX6 PROPERTIES SUFFIX ".scx")
 endif()
 
+# No fused multiply-add: HearSay reproduces the filters sample-exactly with separate multiplies and adds, and clang
+# contracts a * b + c into an FMA by default on arm64.
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    target_compile_options(FMX6 PRIVATE -fvisibility=hidden)
+    target_compile_options(FMX6 PRIVATE -fvisibility=hidden -ffp-contract=off)
+elseif(MSVC)
+    target_compile_options(FMX6 PRIVATE /fp:precise)
 endif()
 
 # Keep the language class next to the compiled plugin for easy installation.

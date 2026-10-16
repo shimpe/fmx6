@@ -116,6 +116,22 @@ struct Halfband {
 struct Svf {
     double ic1;
     double ic2;
+
+    // The coefficients of the last frequency and damping, recomputed only when either changes: the same inputs give
+    // the same coefficients, so this is bit-identical to computing them every sample. Zero frequency never matches.
+    double cachedF;
+    double cachedK;
+    double a1;
+    double a2;
+    double a3;
+
+    // Kept in the first filter of an operator: 2^octaves of the envelope offset and the gain of a peak.
+    bool hasOctaves;
+    double cachedOctaves;
+    double octaveFactor;
+    bool hasGain;
+    double cachedGainDb;
+    double gain;
 };
 
 struct FMX6Op {
@@ -269,13 +285,17 @@ inline float filteredNoise(FMX6Op& op, float cutoffHz, float shape, float sample
 // One TPT state-variable filter step, the same arithmetic as the filtered-noise waveform with k = 1/Q.
 inline void svfTick(double x, double fc, double k, double sampleRate, Svf& s, double& v1, double& v2) {
     const double f = std::max(10.0, std::min(fc, 0.49 * sampleRate));
-    const double g = std::tan(kPi * f / sampleRate);
-    const double a1 = 1.0 / (1.0 + g * (g + k));
-    const double a2 = g * a1;
-    const double a3 = g * a2;
+    if (f != s.cachedF || k != s.cachedK) {
+        const double g = std::tan(kPi * f / sampleRate);
+        s.a1 = 1.0 / (1.0 + g * (g + k));
+        s.a2 = g * s.a1;
+        s.a3 = g * s.a2;
+        s.cachedF = f;
+        s.cachedK = k;
+    }
     const double v3 = x - s.ic2;
-    v1 = a1 * s.ic1 + a2 * v3;
-    v2 = s.ic2 + a2 * s.ic1 + a3 * v3;
+    v1 = s.a1 * s.ic1 + s.a2 * v3;
+    v2 = s.ic2 + s.a2 * s.ic1 + s.a3 * v3;
     s.ic1 = 2.0 * v1 - s.ic1;
     s.ic2 = 2.0 * v2 - s.ic2;
 }
@@ -283,7 +303,12 @@ inline void svfTick(double x, double fc, double k, double sampleRate, Svf& s, do
 // The operator filter. HearSay reproduces this function operation for operation (OperatorFilterKernel).
 inline double operatorFilter(int type, double x, double baseHz, double octaves, double q, double formantRatio,
                              double formantLevel, double gainDb, double sampleRate, Svf& a, Svf& b) {
-    const double fc = baseHz * std::pow(2.0, octaves);
+    if (!a.hasOctaves || octaves != a.cachedOctaves) {
+        a.octaveFactor = std::pow(2.0, octaves);
+        a.cachedOctaves = octaves;
+        a.hasOctaves = true;
+    }
+    const double fc = baseHz * a.octaveFactor;
     const double k = 1.0 / std::max(0.5, std::min(q, 20.0));
     double v1 = 0.0, v2 = 0.0, w1 = 0.0, w2 = 0.0;
     switch (type) {
@@ -311,8 +336,12 @@ inline double operatorFilter(int type, double x, double baseHz, double octaves, 
         return x - k * v1;
     case 7: {
         svfTick(x, fc, k, sampleRate, a, v1, v2);
-        const double g = std::pow(10.0, gainDb / 20.0);
-        return x + (g - 1.0) * (k * v1);
+        if (!a.hasGain || gainDb != a.cachedGainDb) {
+            a.gain = std::pow(10.0, gainDb / 20.0);
+            a.cachedGainDb = gainDb;
+            a.hasGain = true;
+        }
+        return x + (a.gain - 1.0) * (k * v1);
     }
     case 8:
         svfTick(x, fc, k, sampleRate, a, v1, v2);
@@ -586,8 +615,8 @@ void FMX6_Ctor(FMX6* unit) {
         op.svfIc2 = 0.0;
         op.filterFreq = unit->hasFilters ? IN0(filterIndex(i, 1)) : 0.f;
         op.filterOct = unit->hasFilters ? IN0(filterIndex(i, 2)) : 0.f;
-        op.filterA = Svf{0.0, 0.0};
-        op.filterB = Svf{0.0, 0.0};
+        op.filterA = Svf{};
+        op.filterB = Svf{};
     }
 
     for (int i = 0; i < kNumMatrix; ++i) unit->mod[i] = IN0(kModBase + i);
