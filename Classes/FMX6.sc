@@ -1,6 +1,7 @@
 FMX6 : MultiOutUGen {
     *numOperators { ^6 }
     *numControls { ^3 }
+    *numFilterFields { ^7 }
     *controlArraySize { ^this.numOperators * this.numControls }
     *modArraySize { ^this.numOperators.squared }
     *numRequiredInputs { ^this.controlArraySize + (this.numOperators * 3) + this.modArraySize + 1 }
@@ -26,7 +27,7 @@ FMX6 : MultiOutUGen {
     }
 
     *ar {
-        |ctlMatrix, modMatrix, waves = 0, shapes = 0.5, harmonicLimits = 32, oversample = 1|
+        |ctlMatrix, modMatrix, waves = 0, shapes = 0.5, harmonicLimits = 32, oversample = 1, filters|
 
         var ctls;
         var mods;
@@ -34,6 +35,7 @@ FMX6 : MultiOutUGen {
         var sh;
         var hs;
         var inputs;
+        var fs;
 
         ctls = (ctlMatrix ?? { this.controlMatrix }).flatten(1);
         mods = (modMatrix ?? { this.modMatrix }).flatten(1);
@@ -54,6 +56,15 @@ FMX6 : MultiOutUGen {
         };
 
         inputs = ctls ++ ws ++ sh ++ hs ++ mods ++ [oversample];
+
+        // Without filters the SynthDef is exactly what it was before filters existed.
+        if(filters.notNil) {
+            fs = filters.flatten(1);
+            if(fs.size != (this.numOperators * this.numFilterFields)) {
+                Error("FMX6: filters must be 6 rows of [type, freq, octaves, q, formantRatio, formantLevel, gainDb].").throw;
+            };
+            inputs = inputs ++ fs;
+        };
         ^this.multiNewList(['audio'] ++ inputs)
     }
 
@@ -62,10 +73,11 @@ FMX6 : MultiOutUGen {
         ^this.initOutputs(this.class.numOperators, rate)
     }
 
-    // Without the last input (oversample) the plugin behaves as before it existed.
+    // 72 inputs: built before oversampling existed; 73: no filters; 115: with filters.
     checkInputs {
-        ^if(inputs.size != this.class.numRequiredInputs and: { inputs.size != (this.class.numRequiredInputs - 1) }) {
-            this.class.numRequiredInputs.asString ++ " inputs required (" ++ inputs.size ++ ")"
+        var n = this.class.numRequiredInputs;
+        ^if([n - 1, n, n + (this.class.numOperators * this.class.numFilterFields)].includes(inputs.size).not) {
+            n.asString ++ " inputs required (" ++ inputs.size ++ ")"
         }
     }
 
@@ -77,4 +89,14 @@ FMX6 : MultiOutUGen {
     *sampleHoldNoise { ^5 }
     *whiteNoise { ^6 }
     *filteredNoise { ^7 }
+
+    *filterOff { ^0 }
+    *lowPass2 { ^1 }
+    *lowPass4 { ^2 }
+    *highPass2 { ^3 }
+    *highPass4 { ^4 }
+    *bandPass { ^5 }
+    *notch { ^6 }
+    *peak { ^7 }
+    *formant { ^8 }
 }

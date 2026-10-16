@@ -43,6 +43,14 @@ One value or six values, clipped to 1..128. Caps the Fourier-series harmonic cou
 ARGUMENT:: oversample
 1 (default), 2 or 4; fixed when the synth starts. Everything runs at that multiple of the sample rate, including the one-sample matrix feedback, and each operator output is decimated by halfband filters: 67 taps for the last factor of two (passband to 0.4 of the sample rate, 102 dB stopband) and 23 taps before it for 4x. Components that would alias are removed down to about 100 dB, except in the top 20% of the band (above 19.2 kHz at 48 kHz). Costs about as many times the CPU, and adds a latency of 16.5 samples (2x) or 19.25 samples (4x). With 1 the output is identical to earlier versions.
 
+ARGUMENT:: filters
+Optional. Six rows code::[type, freq, octaves, q, formantRatio, formantLevel, gainDb]::, one per operator. The filter
+sits between the waveform and the amplitude: what the operator outputs and what it modulates other operators with is
+the filtered signal. type: 0 off, 1 low-pass 2-pole, 2 low-pass 4-pole, 3 high-pass 2-pole, 4 high-pass 4-pole,
+5 band-pass (unity gain at the centre), 6 notch, 7 peak (gainDb at the centre), 8 formant (band-pass peaks at freq and
+freq * formantRatio, the second at formantLevel). The frequency is code::freq * 2 ** octaves::; drive code::octaves::
+with an EnvGen for a filter sweep. q from 0.5 to 20. Without this argument the UGen behaves as before.
+
 RETURNS::
 Six audio-rate channels, one per operator.
 
@@ -54,6 +62,16 @@ Convenience constructor. Each argument is code::[destinationOperator, sourceOper
 
 EXAMPLES::
 code::
+// A saw through a resonant 4-pole low-pass whose cutoff sweeps up three octaves and back
+(
+{
+    var ctl = FMX6.controlMatrix([0, 110, 0, 0.2]);
+    var sweep = 3 * EnvGen.kr(Env([0, 1, 0], [0.05, 0.6]));
+    var filters = [[2, 220, sweep, 2, 1, 0, 0]] ++ ({ [0, 0, 0, 1, 1, 0, 0] } ! 5);
+    FMX6.ar(ctl, nil, waves: [2, 0, 0, 0, 0, 0], filters: filters)[0] ! 2
+}.play;
+)
+
 (
 {
     var ctl = [

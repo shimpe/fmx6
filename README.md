@@ -30,7 +30,8 @@ FMX6.ar(
     waves: 0,
     shapes: 0.5,
     harmonicLimits: 32,
-    oversample: 1
+    oversample: 1,
+    filters: nil
 )
 ```
 
@@ -45,6 +46,26 @@ FMX6.ar(
 ```
 
 `modMatrix` is 6 x 6, row = destination, column = source. Matrix values are phase modulation in radians per unit source amplitude.
+
+## Operator filters
+
+`filters` is optional: six rows `[type, freq, octaves, q, formantRatio, formantLevel, gainDb]`, one per operator. The filter
+sits between the waveform and the amplitude: what the operator outputs and what it modulates other operators with is
+the filtered signal. type: 0 off, 1 low-pass 2-pole, 2 low-pass 4-pole, 3 high-pass 2-pole, 4 high-pass 4-pole,
+5 band-pass (unity gain at the centre), 6 notch, 7 peak (gainDb at the centre), 8 formant (band-pass peaks at freq and
+freq * formantRatio, the second at formantLevel). The frequency is `freq * 2 ** octaves`; drive `octaves`
+with an EnvGen for a filter sweep. q from 0.5 to 20. Without this argument the UGen behaves as before.
+
+```supercollider
+(
+{
+    var ctl = FMX6.controlMatrix([0, 110, 0, 0.2]);
+    var sweep = 3 * EnvGen.kr(Env([0, 1, 0], [0.05, 0.6]));
+    var filters = [[2, 220, sweep, 2, 1, 0, 0]] ++ ({ [0, 0, 0, 1, 1, 0, 0] } ! 5);
+    FMX6.ar(ctl, nil, waves: [2, 0, 0, 0, 0, 0], filters: filters)[0] ! 2
+}.play;
+)
+```
 
 ## Build
 

@@ -23,6 +23,7 @@ constexpr double kInvTwoPi = 1.0 / kTwoPi;
 //   30 .. 35 : per-operator harmonic limits
 //   36 .. 71 : 6x6 phase-modulation matrix, row-major (destination, source)
 //   72       : oversampling factor 1, 2 or 4 (optional; read once at construction; 1 when absent)
+//   73 .. 114: optional operator filters, six [type, freq, octaves, q, formantRatio, formantLevel, gainDb] rows
 constexpr int kCtlBase = 0;
 constexpr int kWaveBase = kNumOps * kNumControls;
 constexpr int kShapeBase = kWaveBase + kNumOps;
@@ -31,6 +32,17 @@ constexpr int kModBase = kHarmBase + kNumOps;
 constexpr int kNumInputs = kModBase + kNumMatrix;
 constexpr int kOversampleIndex = kNumInputs;
 constexpr int kMaxWave = 7;
+
+// Operator filters (optional): six [type, freq, octaves, q, formantRatio, formantLevel, gainDb] rows after the
+// oversampling input. type: 0 off, 1 LP 2-pole, 2 LP 4-pole, 3 HP 2-pole, 4 HP 4-pole, 5 band-pass, 6 notch, 7 peak,
+// 8 formant. The frequency is freq * 2^octaves, computed here in double precision.
+constexpr int kFilterBase = kOversampleIndex + 1;
+constexpr int kNumFilterFields = 7;
+constexpr int kNumInputsWithFilters = kFilterBase + kNumOps * kNumFilterFields;
+constexpr int kMaxFilterType = 8;
+constexpr double kButterworthK = 1.4142135623730951;
+
+inline int filterIndex(int op, int field) { return kFilterBase + op * kNumFilterFields + field; }
 
 inline int ctlIndex(int op, int field) { return kCtlBase + op * kNumControls + field; }
 inline int freqIndex(int op) { return ctlIndex(op, 0); }
@@ -101,6 +113,11 @@ struct Halfband {
     }
 };
 
+struct Svf {
+    double ic1;
+    double ic2;
+};
+
 struct FMX6Op {
     double phaseCycles;
     float freq;
@@ -112,12 +129,17 @@ struct FMX6Op {
     std::uint32_t rng;
     double svfIc1;
     double svfIc2;
+    float filterFreq;
+    float filterOct;
+    Svf filterA;
+    Svf filterB;
 };
 
 struct FMX6 : public Unit {
     FMX6Op ops[kNumOps];
     float mod[kNumMatrix];
     int oversample;
+    bool hasFilters;
     float* memory;
     float* scratch[kNumOps];
     Halfband finalStage[kNumOps];
@@ -244,6 +266,63 @@ inline float filteredNoise(FMX6Op& op, float cutoffHz, float shape, float sample
     return static_cast<float>(y);
 }
 
+// One TPT state-variable filter step, the same arithmetic as the filtered-noise waveform with k = 1/Q.
+inline void svfTick(double x, double fc, double k, double sampleRate, Svf& s, double& v1, double& v2) {
+    const double f = std::max(10.0, std::min(fc, 0.49 * sampleRate));
+    const double g = std::tan(kPi * f / sampleRate);
+    const double a1 = 1.0 / (1.0 + g * (g + k));
+    const double a2 = g * a1;
+    const double a3 = g * a2;
+    const double v3 = x - s.ic2;
+    v1 = a1 * s.ic1 + a2 * v3;
+    v2 = s.ic2 + a2 * s.ic1 + a3 * v3;
+    s.ic1 = 2.0 * v1 - s.ic1;
+    s.ic2 = 2.0 * v2 - s.ic2;
+}
+
+// The operator filter. HearSay reproduces this function operation for operation (OperatorFilterKernel).
+inline double operatorFilter(int type, double x, double baseHz, double octaves, double q, double formantRatio,
+                             double formantLevel, double gainDb, double sampleRate, Svf& a, Svf& b) {
+    const double fc = baseHz * std::pow(2.0, octaves);
+    const double k = 1.0 / std::max(0.5, std::min(q, 20.0));
+    double v1 = 0.0, v2 = 0.0, w1 = 0.0, w2 = 0.0;
+    switch (type) {
+    case 1:
+        svfTick(x, fc, k, sampleRate, a, v1, v2);
+        return v2;
+    case 2:
+        svfTick(x, fc, kButterworthK, sampleRate, a, v1, v2);
+        svfTick(v2, fc, k, sampleRate, b, w1, w2);
+        return w2;
+    case 3:
+        svfTick(x, fc, k, sampleRate, a, v1, v2);
+        return x - k * v1 - v2;
+    case 4: {
+        svfTick(x, fc, kButterworthK, sampleRate, a, v1, v2);
+        const double hp1 = x - kButterworthK * v1 - v2;
+        svfTick(hp1, fc, k, sampleRate, b, w1, w2);
+        return hp1 - k * w1 - w2;
+    }
+    case 5:
+        svfTick(x, fc, k, sampleRate, a, v1, v2);
+        return k * v1;
+    case 6:
+        svfTick(x, fc, k, sampleRate, a, v1, v2);
+        return x - k * v1;
+    case 7: {
+        svfTick(x, fc, k, sampleRate, a, v1, v2);
+        const double g = std::pow(10.0, gainDb / 20.0);
+        return x + (g - 1.0) * (k * v1);
+    }
+    case 8:
+        svfTick(x, fc, k, sampleRate, a, v1, v2);
+        svfTick(x, fc * formantRatio, k, sampleRate, b, w1, w2);
+        return k * v1 + formantLevel * (k * w1);
+    default:
+        return x;
+    }
+}
+
 inline float evalWaveform(FMX6Op& op, int wave, double phaseRad, float baseHz, float effectiveHz,
                           int harmonicLimit, float shape, float sampleRate, float noiseGain) {
     switch (wave) {
@@ -298,6 +377,15 @@ void FMX6_next(FMX6* unit, int inNumSamples) {
     float modInc[kNumMatrix];
 
     float* outs[kNumOps];
+    int ftype[kNumOps];
+    float ffreq[kNumOps];
+    float ffreqInc[kNumOps];
+    float foct[kNumOps];
+    float foctInc[kNumOps];
+    double fq[kNumOps];
+    double fratio[kNumOps];
+    double flevel[kNumOps];
+    double fgain[kNumOps];
 
     for (int i = 0; i < kNumOps; ++i) {
         FMX6Op& op = unit->ops[i];
@@ -314,6 +402,21 @@ void FMX6_next(FMX6* unit, int inNumSamples) {
         wave[i] = std::max(0, std::min(kMaxWave, static_cast<int>(std::lround(IN0(waveIndex(i))))));
         shape[i] = IN0(shapeIndex(i));
         harmonicLimit[i] = std::max(1, std::min(128, static_cast<int>(std::lround(IN0(harmIndex(i))))));
+        if (unit->hasFilters) {
+            ftype[i] = std::max(0, std::min(kMaxFilterType, static_cast<int>(std::lround(IN0(filterIndex(i, 0))))));
+            ffreq[i] = op.filterFreq;
+            ffreqInc[i] = CALCSLOPE(IN0(filterIndex(i, 1)), ffreq[i]) * slopeScale;
+            foct[i] = op.filterOct;
+            foctInc[i] = CALCSLOPE(IN0(filterIndex(i, 2)), foct[i]) * slopeScale;
+            fq[i] = static_cast<double>(IN0(filterIndex(i, 3)));
+            fratio[i] = static_cast<double>(IN0(filterIndex(i, 4)));
+            flevel[i] = static_cast<double>(IN0(filterIndex(i, 5)));
+            fgain[i] = static_cast<double>(IN0(filterIndex(i, 6)));
+        } else {
+            ftype[i] = 0;
+            ffreq[i] = ffreqInc[i] = foct[i] = foctInc[i] = 0.f;
+            fq[i] = fratio[i] = flevel[i] = fgain[i] = 0.0;
+        }
 
         outs[i] = os == 1 ? OUT(i) : unit->scratch[i];
     }
@@ -357,7 +460,12 @@ void FMX6_next(FMX6* unit, int inNumSamples) {
             const float osc = evalWaveform(
                 op, wave[i], phaseRad, freq[i], effectiveHz, harmonicLimit[i], shape[i], sampleRate, noiseGain);
 
-            const float y = amp[i] * osc;
+            const float shaped = ftype[i] == 0
+                ? osc
+                : static_cast<float>(operatorFilter(ftype[i], static_cast<double>(osc), static_cast<double>(ffreq[i]),
+                                                    static_cast<double>(foct[i]), fq[i], fratio[i], flevel[i], fgain[i],
+                                                    static_cast<double>(sampleRate), op.filterA, op.filterB));
+            const float y = amp[i] * shaped;
             outs[i][s] = y;
 
             // For S&H, change the held value at the boundary so the new value
@@ -379,6 +487,8 @@ void FMX6_next(FMX6* unit, int inNumSamples) {
             freq[i] += freqInc[i];
             phaseOffset[i] += phaseOffsetInc[i];
             amp[i] += ampInc[i];
+            ffreq[i] += ffreqInc[i];
+            foct[i] += foctInc[i];
         }
 
         for (int i = 0; i < kNumMatrix; ++i) mod[i] += modInc[i];
@@ -400,6 +510,8 @@ void FMX6_next(FMX6* unit, int inNumSamples) {
         unit->ops[i].freq = freq[i];
         unit->ops[i].phaseOffset = phaseOffset[i];
         unit->ops[i].amp = amp[i];
+        unit->ops[i].filterFreq = ffreq[i];
+        unit->ops[i].filterOct = foct[i];
     }
     for (int i = 0; i < kNumMatrix; ++i) unit->mod[i] = mod[i];
 }
@@ -411,12 +523,14 @@ void FMX6_clear(FMX6* unit, int inNumSamples) {
 void FMX6_Ctor(FMX6* unit) {
     unit->memory = nullptr;
     unit->oversample = 1;
+    unit->hasFilters = false;
     SETCALC(FMX6_next);
 
     // Without the oversampling input the UGen behaves as before; SynthDefs built before it existed keep working.
-    if ((unit->mNumInputs != kNumInputs && unit->mNumInputs != kNumInputs + 1) || unit->mNumOutputs != kNumOps) {
-        Print("FMX6: expected %d or %d inputs and %d outputs, got %d inputs and %d outputs.\n",
-              kNumInputs, kNumInputs + 1, kNumOps, unit->mNumInputs, unit->mNumOutputs);
+    if ((unit->mNumInputs != kNumInputs && unit->mNumInputs != kNumInputs + 1 && unit->mNumInputs != kNumInputsWithFilters)
+        || unit->mNumOutputs != kNumOps) {
+        Print("FMX6: expected %d, %d or %d inputs and %d outputs, got %d inputs and %d outputs.\n",
+              kNumInputs, kNumInputs + 1, kNumInputsWithFilters, kNumOps, unit->mNumInputs, unit->mNumOutputs);
         SETCALC(FMX6_clear);
         ClearUnitOutputs(unit, 1);
         return;
@@ -426,6 +540,8 @@ void FMX6_Ctor(FMX6* unit) {
         const float requested = IN0(kOversampleIndex);
         unit->oversample = requested >= 3.f ? 4 : (requested >= 1.5f ? 2 : 1);
     }
+
+    unit->hasFilters = unit->mNumInputs == kNumInputsWithFilters;
 
     if (unit->oversample > 1) {
         // One block for everything: per operator the oversampled samples, the final stage and, for 4x, the first.
@@ -468,6 +584,10 @@ void FMX6_Ctor(FMX6* unit) {
         op.sampleHold = randBipolar(op.rng);
         op.svfIc1 = 0.0;
         op.svfIc2 = 0.0;
+        op.filterFreq = unit->hasFilters ? IN0(filterIndex(i, 1)) : 0.f;
+        op.filterOct = unit->hasFilters ? IN0(filterIndex(i, 2)) : 0.f;
+        op.filterA = Svf{0.0, 0.0};
+        op.filterB = Svf{0.0, 0.0};
     }
 
     for (int i = 0; i < kNumMatrix; ++i) unit->mod[i] = IN0(kModBase + i);
