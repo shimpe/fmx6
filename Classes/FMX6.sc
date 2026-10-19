@@ -2,6 +2,10 @@ FMX6 : MultiOutUGen {
     *numOperators { ^6 }
     *numControls { ^3 }
     *numFilterFields { ^7 }
+    // Formants F2..F5 of a formant filter: [q2, ratio3, level3, q3, ratio4, level4, q4, ratio5, level5, q5].
+    *numFormantFields { ^10 }
+    // F2 with the filter's q, F3..F5 off.
+    *defaultFormantFields { ^[0, 1, 0, 0, 1, 0, 0, 1, 0, 0] }
     *controlArraySize { ^this.numOperators * this.numControls }
     *modArraySize { ^this.numOperators.squared }
     *numRequiredInputs { ^this.controlArraySize + (this.numOperators * 3) + this.modArraySize + 1 }
@@ -36,6 +40,8 @@ FMX6 : MultiOutUGen {
         var hs;
         var inputs;
         var fs;
+        var rows;
+        var wide;
 
         ctls = (ctlMatrix ?? { this.controlMatrix }).flatten(1);
         mods = (modMatrix ?? { this.modMatrix }).flatten(1);
@@ -58,10 +64,25 @@ FMX6 : MultiOutUGen {
         inputs = ctls ++ ws ++ sh ++ hs ++ mods ++ [oversample];
 
         // Without filters the SynthDef is exactly what it was before filters existed.
+        // Rows of 7 fields give exactly the SynthDef of earlier versions. When a row has 17 fields, its first 7 go with
+        // the other rows and its last 10 go into a block after all six rows; 7-field rows then get the defaults there.
         if(filters.notNil) {
-            fs = filters.flatten(1);
-            if(fs.size != (this.numOperators * this.numFilterFields)) {
-                Error("FMX6: filters must be 6 rows of [type, freq, octaves, q, formantRatio, formantLevel, gainDb].").throw;
+            rows = filters.asArray;
+            wide = (rows.size == this.numOperators)
+                and: { rows.every { |r| r.isArray and: { [this.numFilterFields, this.numFilterFields + this.numFormantFields].includes(r.size) } } };
+            wide = wide and: { rows.any { |r| r.size == (this.numFilterFields + this.numFormantFields) } };
+            if(wide) {
+                fs = rows.collect { |r| r.copyRange(0, this.numFilterFields - 1) }.flatten(1)
+                    ++ rows.collect { |r|
+                        if(r.size > this.numFilterFields) { r.copyToEnd(this.numFilterFields) } { this.defaultFormantFields }
+                    }.flatten(1);
+            } {
+                fs = filters.flatten(1);
+                if(fs.size != (this.numOperators * this.numFilterFields)) {
+                    Error("FMX6: filters must be 6 rows of either [type, freq, octaves, q, formantRatio, formantLevel, gainDb] "
+                        ++ "or [type, freq, octaves, q, ratio2, level2, gainDb, q2, ratio3, level3, q3, ratio4, level4, q4, "
+                        ++ "ratio5, level5, q5].").throw;
+                };
             };
             inputs = inputs ++ fs;
         };
@@ -73,10 +94,11 @@ FMX6 : MultiOutUGen {
         ^this.initOutputs(this.class.numOperators, rate)
     }
 
-    // 72 inputs: built before oversampling existed; 73: no filters; 115: with filters.
+    // 72 inputs: built before oversampling existed; 73: no filters; 115: with filters; 175: with five formants.
     checkInputs {
         var n = this.class.numRequiredInputs;
-        ^if([n - 1, n, n + (this.class.numOperators * this.class.numFilterFields)].includes(inputs.size).not) {
+        var f = n + (this.class.numOperators * this.class.numFilterFields);
+        ^if([n - 1, n, f, f + (this.class.numOperators * this.class.numFormantFields)].includes(inputs.size).not) {
             n.asString ++ " inputs required (" ++ inputs.size ++ ")"
         }
     }

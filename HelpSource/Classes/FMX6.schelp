@@ -49,7 +49,15 @@ sits between the waveform and the amplitude: what the operator outputs and what 
 the filtered signal. type: 0 off, 1 low-pass 2-pole, 2 low-pass 4-pole, 3 high-pass 2-pole, 4 high-pass 4-pole,
 5 band-pass (unity gain at the centre), 6 notch, 7 peak (gainDb at the centre), 8 formant (band-pass peaks at freq and
 freq * formantRatio, the second at formantLevel). The frequency is code::freq * 2 ** octaves::; drive code::octaves::
-with an EnvGen for a filter sweep. q from 0.5 to 20. Without this argument the UGen behaves as before.
+with an EnvGen for a filter sweep. q from 0.5 to 20, for a formant filter 0.5 to 50. Without this argument the UGen
+behaves as before.
+
+A row can instead have 17 fields for a formant filter with five formants, each with its own q:
+code::[type, freq, octaves, q, ratio2, level2, gainDb, q2, ratio3, level3, q3, ratio4, level4, q4, ratio5, level5, q5]::.
+F1 is at the filter frequency with q; formant n is at F1 * ratioN with levelN (relative to F1) and qN, and a qN of 0 or
+less means the same as q. The response is the sum of unity-gain band-passes, F1 + level2 * F2 + ... + level5 * F5; a
+formant F3..F5 whose level is 0 is off and costs nothing. 7- and 17-field rows can be mixed (a 7-field row has F2 with
+q and F3..F5 off). With only 7-field rows the SynthDef is the same as before.
 
 RETURNS::
 Six audio-rate channels, one per operator.
@@ -69,6 +77,16 @@ code::
     var sweep = 3 * EnvGen.kr(Env([0, 1, 0], [0.05, 0.6]));
     var filters = [[2, 220, sweep, 2, 1, 0, 0]] ++ ({ [0, 0, 0, 1, 1, 0, 0] } ! 5);
     FMX6.ar(ctl, nil, waves: [2, 0, 0, 0, 0, 0], filters: filters)[0] ! 2
+}.play;
+)
+
+// A soprano "a": five formants at 800, 1150, 2900, 3900 and 4950 Hz, each with its own q
+(
+{
+    var ctl = FMX6.controlMatrix([0, 220, 0, 0.5]);
+    var vowel = [8, 800, 0, 10, 1.4375, 0.5012, 0, 12.78, 3.625, 0.0251, 24.17, 4.875, 0.1, 30, 6.1875, 0.0032, 35.36];
+    var filters = [vowel] ++ ({ [0, 0, 0, 1, 1, 0, 0] } ! 5);
+    FMX6.ar(ctl, nil, waves: [2, 0, 0, 0, 0, 0], harmonicLimits: 64, filters: filters)[0] ! 2
 }.play;
 )
 

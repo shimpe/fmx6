@@ -24,6 +24,8 @@ constexpr double kInvTwoPi = 1.0 / kTwoPi;
 //   36 .. 71 : 6x6 phase-modulation matrix, row-major (destination, source)
 //   72       : oversampling factor 1, 2 or 4 (optional; read once at construction; 1 when absent)
 //   73 .. 114: optional operator filters, six [type, freq, octaves, q, formantRatio, formantLevel, gainDb] rows
+//   115 .. 174: optional formants F2..F5 of the filters, six [q2, ratio3, level3, q3, ratio4, level4, q4, ratio5,
+//               level5, q5] rows (only together with the filter rows)
 constexpr int kCtlBase = 0;
 constexpr int kWaveBase = kNumOps * kNumControls;
 constexpr int kShapeBase = kWaveBase + kNumOps;
@@ -41,8 +43,18 @@ constexpr int kNumFilterFields = 7;
 constexpr int kNumInputsWithFilters = kFilterBase + kNumOps * kNumFilterFields;
 constexpr int kMaxFilterType = 8;
 constexpr double kButterworthK = 1.4142135623730951;
+constexpr double kMaxQ = 20.0;
+constexpr double kMaxFormantQ = 50.0;
+
+// Formant filters (type 8) have five peaks F1..F5. F1 is at the filter frequency with q; F2..F5 each have a ratio to F1,
+// a level relative to F1 and their own q. Without the formant rows F2 has the filter's q and F3..F5 are off.
+constexpr int kNumFormants = 5;
+constexpr int kFormantBase = kNumInputsWithFilters;
+constexpr int kNumFormantFields = 10;
+constexpr int kNumInputsWithFormants = kFormantBase + kNumOps * kNumFormantFields;
 
 inline int filterIndex(int op, int field) { return kFilterBase + op * kNumFilterFields + field; }
+inline int formantIndex(int op, int field) { return kFormantBase + op * kNumFormantFields + field; }
 
 inline int ctlIndex(int op, int field) { return kCtlBase + op * kNumControls + field; }
 inline int freqIndex(int op) { return ctlIndex(op, 0); }
@@ -147,8 +159,15 @@ struct FMX6Op {
     double svfIc2;
     float filterFreq;
     float filterOct;
-    Svf filterA;
-    Svf filterB;
+    // One state per peak: the two stages of a 4-pole filter are 0 and 1, formant Fn is n - 1.
+    Svf filter[kNumFormants];
+};
+
+// A formant peak F2..F5: frequency F1 * ratio, level relative to F1, q (0 or less: the filter's q).
+struct FormantPeak {
+    double ratio;
+    double level;
+    double q;
 };
 
 struct FMX6 : public Unit {
@@ -156,6 +175,7 @@ struct FMX6 : public Unit {
     float mod[kNumMatrix];
     int oversample;
     bool hasFilters;
+    bool hasFormants;
     float* memory;
     float* scratch[kNumOps];
     Halfband finalStage[kNumOps];
@@ -301,15 +321,18 @@ inline void svfTick(double x, double fc, double k, double sampleRate, Svf& s, do
 }
 
 // The operator filter. HearSay reproduces this function operation for operation (OperatorFilterKernel).
-inline double operatorFilter(int type, double x, double baseHz, double octaves, double q, double formantRatio,
-                             double formantLevel, double gainDb, double sampleRate, Svf& a, Svf& b) {
+// peaks are the formants F2..F5 (used by type 8 only); s holds one state per peak (kNumFormants).
+inline double operatorFilter(int type, double x, double baseHz, double octaves, double q, const FormantPeak* peaks,
+                             double gainDb, double sampleRate, Svf* s) {
+    Svf& a = s[0];
+    Svf& b = s[1];
     if (!a.hasOctaves || octaves != a.cachedOctaves) {
         a.octaveFactor = std::pow(2.0, octaves);
         a.cachedOctaves = octaves;
         a.hasOctaves = true;
     }
     const double fc = baseHz * a.octaveFactor;
-    const double k = 1.0 / std::max(0.5, std::min(q, 20.0));
+    const double k = 1.0 / std::max(0.5, std::min(q, kMaxQ));
     double v1 = 0.0, v2 = 0.0, w1 = 0.0, w2 = 0.0;
     switch (type) {
     case 1:
@@ -343,10 +366,31 @@ inline double operatorFilter(int type, double x, double baseHz, double octaves, 
         }
         return x + (a.gain - 1.0) * (k * v1);
     }
-    case 8:
-        svfTick(x, fc, k, sampleRate, a, v1, v2);
-        svfTick(x, fc * formantRatio, k, sampleRate, b, w1, w2);
-        return k * v1 + formantLevel * (k * w1);
+    case 8: {
+        // Formant: a sum of unity-gain band-passes, every peak on the same input x. In this exact order:
+        //   k1 = 1 / max(0.5, min(q, 50))
+        //   svfTick(x, fc, k1, s[0])                          -> v1
+        //   y = k1 * v1                                        (F1)
+        //   for n = 2, 3, 4, 5 (peaks[n - 2] = {ratio, level, qn}):
+        //     if n >= 3 and level == 0: skip                   (F3..F5 off: not computed, s[n - 1] untouched)
+        //     kn = 1 / max(0.5, min(qn > 0 ? qn : q, 50))
+        //     svfTick(x, fc * ratio, kn, s[n - 1])             -> w1
+        //     y = y + level * (kn * w1)                        (Fn)
+        // so y = ((((k1*v1 + L2*(k2*v1_2)) + L3*(k3*v1_3)) + L4*(k4*v1_4)) + L5*(k5*v1_5)), added left to right.
+        // F2 is always computed, as before. With q <= 20, q2 the same as q and F3..F5 off this is the two-peak
+        // formula k * v1 + formantLevel * (k * w1) of earlier versions, bit for bit.
+        const double k1 = 1.0 / std::max(0.5, std::min(q, kMaxFormantQ));
+        svfTick(x, fc, k1, sampleRate, a, v1, v2);
+        double y = k1 * v1;
+        for (int n = 2; n <= kNumFormants; ++n) {
+            const FormantPeak& p = peaks[n - 2];
+            if (n >= 3 && p.level == 0.0) continue;
+            const double kn = 1.0 / std::max(0.5, std::min(p.q > 0.0 ? p.q : q, kMaxFormantQ));
+            svfTick(x, fc * p.ratio, kn, sampleRate, s[n - 1], w1, w2);
+            y = y + p.level * (kn * w1);
+        }
+        return y;
+    }
     default:
         return x;
     }
@@ -412,8 +456,7 @@ void FMX6_next(FMX6* unit, int inNumSamples) {
     float foct[kNumOps];
     float foctInc[kNumOps];
     double fq[kNumOps];
-    double fratio[kNumOps];
-    double flevel[kNumOps];
+    FormantPeak fpeaks[kNumOps][kNumFormants - 1];
     double fgain[kNumOps];
 
     for (int i = 0; i < kNumOps; ++i) {
@@ -438,13 +481,26 @@ void FMX6_next(FMX6* unit, int inNumSamples) {
             foct[i] = op.filterOct;
             foctInc[i] = CALCSLOPE(IN0(filterIndex(i, 2)), foct[i]) * slopeScale;
             fq[i] = static_cast<double>(IN0(filterIndex(i, 3)));
-            fratio[i] = static_cast<double>(IN0(filterIndex(i, 4)));
-            flevel[i] = static_cast<double>(IN0(filterIndex(i, 5)));
+            fpeaks[i][0].ratio = static_cast<double>(IN0(filterIndex(i, 4)));
+            fpeaks[i][0].level = static_cast<double>(IN0(filterIndex(i, 5)));
             fgain[i] = static_cast<double>(IN0(filterIndex(i, 6)));
+            if (unit->hasFormants) {
+                // [q2, ratio3, level3, q3, ratio4, level4, q4, ratio5, level5, q5]
+                fpeaks[i][0].q = static_cast<double>(IN0(formantIndex(i, 0)));
+                for (int n = 1; n < kNumFormants - 1; ++n) {
+                    fpeaks[i][n].ratio = static_cast<double>(IN0(formantIndex(i, 3 * n - 2)));
+                    fpeaks[i][n].level = static_cast<double>(IN0(formantIndex(i, 3 * n - 1)));
+                    fpeaks[i][n].q = static_cast<double>(IN0(formantIndex(i, 3 * n)));
+                }
+            } else {
+                fpeaks[i][0].q = 0.0;
+                for (int n = 1; n < kNumFormants - 1; ++n) fpeaks[i][n] = FormantPeak{1.0, 0.0, 0.0};
+            }
         } else {
             ftype[i] = 0;
             ffreq[i] = ffreqInc[i] = foct[i] = foctInc[i] = 0.f;
-            fq[i] = fratio[i] = flevel[i] = fgain[i] = 0.0;
+            fq[i] = fgain[i] = 0.0;
+            for (int n = 0; n < kNumFormants - 1; ++n) fpeaks[i][n] = FormantPeak{1.0, 0.0, 0.0};
         }
 
         outs[i] = os == 1 ? OUT(i) : unit->scratch[i];
@@ -492,8 +548,8 @@ void FMX6_next(FMX6* unit, int inNumSamples) {
             const float shaped = ftype[i] == 0
                 ? osc
                 : static_cast<float>(operatorFilter(ftype[i], static_cast<double>(osc), static_cast<double>(ffreq[i]),
-                                                    static_cast<double>(foct[i]), fq[i], fratio[i], flevel[i], fgain[i],
-                                                    static_cast<double>(sampleRate), op.filterA, op.filterB));
+                                                    static_cast<double>(foct[i]), fq[i], fpeaks[i], fgain[i],
+                                                    static_cast<double>(sampleRate), op.filter));
             const float y = amp[i] * shaped;
             outs[i][s] = y;
 
@@ -553,13 +609,16 @@ void FMX6_Ctor(FMX6* unit) {
     unit->memory = nullptr;
     unit->oversample = 1;
     unit->hasFilters = false;
+    unit->hasFormants = false;
     SETCALC(FMX6_next);
 
     // Without the oversampling input the UGen behaves as before; SynthDefs built before it existed keep working.
-    if ((unit->mNumInputs != kNumInputs && unit->mNumInputs != kNumInputs + 1 && unit->mNumInputs != kNumInputsWithFilters)
+    if ((unit->mNumInputs != kNumInputs && unit->mNumInputs != kNumInputs + 1 && unit->mNumInputs != kNumInputsWithFilters
+         && unit->mNumInputs != kNumInputsWithFormants)
         || unit->mNumOutputs != kNumOps) {
-        Print("FMX6: expected %d, %d or %d inputs and %d outputs, got %d inputs and %d outputs.\n",
-              kNumInputs, kNumInputs + 1, kNumInputsWithFilters, kNumOps, unit->mNumInputs, unit->mNumOutputs);
+        Print("FMX6: expected %d, %d, %d or %d inputs and %d outputs, got %d inputs and %d outputs.\n",
+              kNumInputs, kNumInputs + 1, kNumInputsWithFilters, kNumInputsWithFormants, kNumOps, unit->mNumInputs,
+              unit->mNumOutputs);
         SETCALC(FMX6_clear);
         ClearUnitOutputs(unit, 1);
         return;
@@ -570,7 +629,8 @@ void FMX6_Ctor(FMX6* unit) {
         unit->oversample = requested >= 3.f ? 4 : (requested >= 1.5f ? 2 : 1);
     }
 
-    unit->hasFilters = unit->mNumInputs == kNumInputsWithFilters;
+    unit->hasFormants = unit->mNumInputs == kNumInputsWithFormants;
+    unit->hasFilters = unit->mNumInputs == kNumInputsWithFilters || unit->hasFormants;
 
     if (unit->oversample > 1) {
         // One block for everything: per operator the oversampled samples, the final stage and, for 4x, the first.
@@ -615,8 +675,7 @@ void FMX6_Ctor(FMX6* unit) {
         op.svfIc2 = 0.0;
         op.filterFreq = unit->hasFilters ? IN0(filterIndex(i, 1)) : 0.f;
         op.filterOct = unit->hasFilters ? IN0(filterIndex(i, 2)) : 0.f;
-        op.filterA = Svf{};
-        op.filterB = Svf{};
+        for (Svf& f : op.filter) f = Svf{};
     }
 
     for (int i = 0; i < kNumMatrix; ++i) unit->mod[i] = IN0(kModBase + i);
