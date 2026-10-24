@@ -39,3 +39,14 @@ add_custom_command(TARGET FMX6 POST_BUILD
         "${CMAKE_CURRENT_SOURCE_DIR}/Classes/FMX6.sc"
         "$<TARGET_FILE_DIR:FMX6>/Classes/FMX6.sc"
 )
+
+# Installation layout (used by `cmake --build . --target install`): the plugin binary plus the sclang classes, help,
+# examples and docs, all under <prefix>/FMX6.
+install(TARGETS FMX6
+    LIBRARY DESTINATION FMX6/plugins
+    RUNTIME DESTINATION FMX6/plugins
+)
+install(DIRECTORY Classes DESTINATION FMX6)
+install(DIRECTORY HelpSource DESTINATION FMX6)
+install(DIRECTORY examples DESTINATION FMX6)
+install(FILES README.md LICENSE DESTINATION FMX6)
